@@ -5,7 +5,7 @@ ShipPipeline — 主流水线编排
   YOLO 检测 → VLM识别 → 查库+语义检索 → 绑定结果 → 绘制输出
 
 并发模式（concurrent_mode=true）：
-  YOLO 检测 → crop 送入队列 → Agent 独立线程异步推理
+  YOLO 检测 → crop 送入队列 → 异步推理
   → 结果按帧时间戳严格顺序出队 → 匹配到对应帧绘制输出
 
 双层并发架构：
@@ -32,6 +32,7 @@ from pipeline.output import ScreenshotSaver
 from pipeline.fps import FPSMeter, LatencyMeter
 from pipeline.tracker import TrackManager
 from pipeline.video_input import InputSource
+from pipeline.hull_number_locator import HullNumberLocator, build_inverse_crop_info
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ class ShipPipeline:
     """
     船弦号识别视频处理流水线。
 
-    整合 YOLO 检测、Agent 推理、跟踪管理，支持级联/并发双模式。
+    整合 YOLO 检测、VLM 推理、弦号定位、跟踪管理，支持级联/并发双模式。
     """
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -67,21 +68,33 @@ class ShipPipeline:
         self._detect_every_n: int = max(1, pipe_cfg.get("detect_every_n_frames") or 1)
         self._demo_enabled: bool = bool(pipe_cfg.get("demo", False))
         self._save_screenshots: bool = bool(pipe_cfg.get("save_screenshots", True))
-        self._use_agent: bool = bool(pipe_cfg.get("use_agent", False))
         self._enable_refresh: bool = bool(pipe_cfg.get("enable_refresh", False))
         self._gap_num: int = pipe_cfg.get("gap_num") or 150
         self._prompt_mode: str = pipe_cfg.get("prompt_mode") or "detailed"
 
-        # 读取 Agent 数据库配置
+        # 弦号定位配置
+        self._enable_locate: bool = bool(pipe_cfg.get("enable_hull_number_locate", False))
+        locate_cfg = pipe_cfg.get("hull_number_locate", {})
+
+        # 初始化弦号定位器
+        self._locator: HullNumberLocator | None = None
+        if self._enable_locate:
+            self._locator = HullNumberLocator(
+                use_gpu=locate_cfg.get("use_gpu", False),
+                lang=locate_cfg.get("lang", "en"),
+                det_db_thresh=locate_cfg.get("det_db_thresh", 0.3),
+                det_db_box_thresh=locate_cfg.get("det_db_box_thresh", 0.5),
+                rec_batch_num=locate_cfg.get("rec_batch_num", 1),
+            )
+            if self._locator.available:
+                logger.info("弦号定位已启用 (PaddleOCR)")
+            else:
+                logger.warning("弦号定位初始化失败: %s", self._locator.init_error)
+                self._enable_locate = False
+
+        # 读取数据库配置
         from database import ShipDatabase
         self._db = ShipDatabase(config=config)
-
-        # Agent 模式：初始化 LangChain ReAct Agent
-        self._agent = None
-        if self._use_agent:
-            from agent import create_agent
-            self._agent = create_agent(config=config)
-            logger.info("Agent 模式已启用：使用 LangChain ReAct Agent（lookup + retrieve 两步工具链）")
 
         # 初始化组件
         self._detector = ShipDetector(
@@ -115,26 +128,26 @@ class ShipPipeline:
             maxsize=self._max_queued_frames
         )
         self._result_queue: queue.Queue = queue.Queue(maxsize=self._max_queued_frames)
-        self._agent_workers: list[threading.Thread] = []
+        self._worker_threads: list[threading.Thread] = []
         self._stop_event = threading.Event()
 
-        # Agent 运行链路日志（限制最大条数防内存泄漏）
-        self._agent_trace: list[dict[str, Any]] = []
+        # 运行链路日志（限制最大条数防内存泄漏）
+        self._trace: list[dict[str, Any]] = []
         self._trace_lock = threading.Lock()
         self._max_trace_entries = 500
 
         logger.info(
-            "ShipPipeline 初始化: mode=%s, inference=%s, process_every=%d, refresh=%s(gap=%d)",
+            "ShipPipeline 初始化: mode=%s, process_every=%d, refresh=%s(gap=%d), locate=%s",
             "concurrent" if self._concurrent_mode else "cascade",
-            "agent" if self._use_agent else "hardcoded",
             self._process_every_n,
             "on" if self._enable_refresh else "off",
             self._gap_num,
+            "on" if self._enable_locate else "off",
         )
 
-    # ── Agent 链路日志 ──────────────────────────
+    # ── 链路日志 ──────────────────────────────
 
-    def _log_agent_trace(
+    def _log_trace(
         self,
         event_type: str,
         track_id: int,
@@ -142,7 +155,7 @@ class ShipPipeline:
         content: str = "",
         **extra: Any,
     ) -> None:
-        """记录 Agent 运行链路到内存 trace（不直接打印，由 _log_track_summary 统一汇总）。"""
+        """记录运行链路到内存 trace。"""
         entry = {
             "type": event_type,
             "track_id": track_id,
@@ -152,44 +165,34 @@ class ShipPipeline:
             **extra,
         }
         with self._trace_lock:
-            self._agent_trace.append(entry)
-            # 超过上限时截断，保留最近一半
-            if len(self._agent_trace) > self._max_trace_entries:
-                self._agent_trace = self._agent_trace[-(self._max_trace_entries // 2):]
+            self._trace.append(entry)
+            if len(self._trace) > self._max_trace_entries:
+                self._trace = self._trace[-(self._max_trace_entries // 2):]
 
     def _log_track_summary(self, track_id: int) -> None:
         """汇总指定 track 的全部链路步骤，一条日志输出 Step1/Step2/Step3。"""
         with self._trace_lock:
-            entries = [e for e in self._agent_trace if e["track_id"] == track_id]
+            entries = [e for e in self._trace if e["track_id"] == track_id]
 
         if not entries:
             return
 
-        # 取最新的一个完整链路（同一个 track 可能被刷新多次）
-        # 按 frame_id 降序，取最新一组
         latest_frame = max(e["frame_id"] for e in entries)
         entries = [e for e in entries if e["frame_id"] == latest_frame]
 
-        frame_id = latest_frame
         types = {e["type"]: e["content"] for e in entries}
 
-        # Step1: VLM 预识别
-        step1 = types.get("agent_vlm_preinfer") or types.get("cascade_vlm") or "—"
-        # Step2: 精确查找
-        step2 = types.get("cascade_lookup") or "—"
-        # Step3: 语义检索 / 最终结果
-        step3 = (types.get("agent_chain_result")
-                 or types.get("agent_fallback")
-                 or types.get("cascade_result")
-                 or types.get("agent_error_fallback")
-                 or "—")
+        step1 = types.get("vlm_recognize") or "—"
+        step2 = types.get("lookup") or "—"
+        step3 = types.get("result") or "—"
+        locate = types.get("locate") or "—"
 
         logger.info(
-            "[Track %d] frame=%d | Step1(VLM): %s | Step2(Lookup): %s | Step3(Result): %s",
-            track_id, frame_id, step1, step2, step3,
+            "[Track %d] frame=%d | Step1(VLM): %s | Step2(Lookup): %s | Step3(Result): %s | Locate: %s",
+            track_id, latest_frame, step1, step2, step3, locate,
         )
 
-    # ── 工具方法 ──────────────────────────────────
+    # ── 工具方法 ──────────────────────────────
 
     @staticmethod
     def _encode_image(image: np.ndarray) -> str:
@@ -207,10 +210,6 @@ class ShipPipeline:
     ) -> AgentResult:
         """
         执行三步链路：VLM识别 → 精确查找 → 语义检索。
-
-        第1步: _vlm_infer(crop) → 弦号 + 描述
-        第2步: db.lookup(hull_number) → 有弦号时精确查找
-        第3步: db.semantic_search_filtered(description) → 弦号未匹配或无弦号时语义检索
         """
         from tools import _vlm_infer
 
@@ -220,8 +219,8 @@ class ShipPipeline:
         hull_number = vlm_result.get("hull_number", "")
         description = vlm_result.get("description", "")
 
-        self._log_agent_trace(
-            "cascade_vlm",
+        self._log_trace(
+            "vlm_recognize",
             track_id=track_id,
             frame_id=frame_id,
             content=f"弦号={hull_number or '(无)'} 描述={description[:40] if description else '(无)'}",
@@ -241,7 +240,6 @@ class ShipPipeline:
     ) -> AgentResult:
         """
         本地查库 + 语义检索（不含 VLM 调用）。
-        供 _run_three_step_chain 和 _run_agent_chain fallback 使用。
         """
         exact_matched = False
         semantic_ids: list[str] = []
@@ -261,14 +259,14 @@ class ShipPipeline:
         match_type = "exact" if exact_matched else ("semantic" if semantic_ids else "none")
 
         if track_id:
-            self._log_agent_trace(
-                "cascade_lookup",
+            self._log_trace(
+                "lookup",
                 track_id=track_id,
                 frame_id=frame_id,
                 content=f"精确查找: {'命中' if exact_matched else '未命中'}",
             )
-            self._log_agent_trace(
-                "cascade_result",
+            self._log_trace(
+                "result",
                 track_id=track_id,
                 frame_id=frame_id,
                 content=f"弦号={hull_number or '(无)'} 匹配={match_type} 语义候选={semantic_ids}",
@@ -281,98 +279,68 @@ class ShipPipeline:
             semantic_match_ids=semantic_ids,
         )
 
-    def _run_agent_chain(self, crop: np.ndarray, track_id: int = 0, frame_id: int = 0) -> AgentResult:
+    def _locate_hull_number(
+        self,
+        crop: np.ndarray,
+        det: Detection,
+        frame_w: int,
+        frame_h: int,
+        track_id: int = 0,
+        frame_id: int = 0,
+    ) -> list[tuple[int, int, int, int]]:
         """
-        Agent 模式执行链路。
+        在 crop 中定位弦号文字区域，返回原帧坐标系下的 bbox 列表。
 
-        1. 本地 VLM 预识别（一次调用，结果以文本传入 Agent）
-        2. Agent 编排 lookup + retrieve 两步工具链（不再调用 VLM）
+        Args:
+            crop: YOLO 裁剪的船只图像。
+            det: 检测结果（包含 bbox）。
+            frame_w, frame_h: 原帧尺寸。
+            track_id: 跟踪 ID。
+            frame_id: 帧编号。
 
-        Agent 的工具集不含 recognize_ship，避免重复 VLM 调用。
+        Returns:
+            弦号文字区域在原帧中的 bbox 列表 [(x1,y1,x2,y2), ...]。
         """
-        if self._agent is None:
-            raise RuntimeError("Agent 模式未初始化（use_agent=True 但 agent 为 None）")
+        if not self._enable_locate or self._locator is None:
+            return []
 
-        from tools import _vlm_infer
+        # 构建坐标逆变换信息
+        x1, y1, x2, y2 = det.bbox
+        inverse_info = build_inverse_crop_info(
+            x1, y1, x2, y2,
+            frame_w, frame_h,
+        )
 
-        crop_b64 = self._encode_image(crop)
-        vlm_result = _vlm_infer(crop_b64, prompt_mode=self._prompt_mode)
-        hull_number = vlm_result.get("hull_number", "")
-        description = vlm_result.get("description", "")
+        # PaddleOCR 定位
+        regions = self._locator.locate(crop, inverse_crop_info=inverse_info)
 
-        self._log_agent_trace(
-            "agent_vlm_preinfer",
+        bboxes = [r.bbox for r in regions]
+
+        self._log_trace(
+            "locate",
             track_id=track_id,
             frame_id=frame_id,
-            content=f"VLM预识别: 弦号={hull_number or '(无)'} 描述={description[:50] if description else '(无)'}",
+            content=f"定位到 {len(bboxes)} 个文字区域: {[r.text for r in regions[:3]]}",
         )
 
-        if not hull_number and not description:
-            return AgentResult(answer="VLM 未返回结果")
-
-        # 将 VLM 结果以文本传入 Agent，Agent 只做 lookup + retrieve（不含 recognize_ship）
-        query = (
-            f"VLM 识别结果：弦号=\"{hull_number}\"，描述=\"{description}\"。"
-            f"请按步骤查找数据库。"
-        )
-
-        try:
-            result = self._agent.run_with_result(query)
-        except Exception as e:
-            logger.exception("Agent 执行异常，回退本地检索")
-            self._log_agent_trace("agent_error_fallback", track_id, frame_id, content=str(e))
-            return self._local_lookup_retrieve(hull_number, description, track_id=track_id, frame_id=frame_id)
-
-        # Agent 结果兜底：若 Agent 未返回 hull_number 但 VLM 有识别值，用 VLM 的值
-        if not result.hull_number and hull_number:
-            result.hull_number = hull_number
-
-        # 记录 Agent 的 lookup 结果（补 Step2 日志）
-        if result.match_type == "exact":
-            self._log_agent_trace(
-                "cascade_lookup", track_id=track_id, frame_id=frame_id,
-                content=f"精确查找: 命中 (弦号={result.hull_number})",
-            )
-        elif hull_number:
-            self._log_agent_trace(
-                "cascade_lookup", track_id=track_id, frame_id=frame_id,
-                content=f"精确查找: 未命中 (VLM弦号={hull_number} 不在库内)",
-            )
-
-        # Agent 返回了有效结果，直接使用
-        if result.hull_number or result.semantic_match_ids:
-            self._log_agent_trace(
-                "agent_chain_result", track_id, frame_id,
-                content=f"弦号={result.hull_number or '(无)'} 匹配={result.match_type} 语义候选={result.semantic_match_ids}",
-            )
-            return result
-
-        # Agent 无结果（可能是 LLM 没按指示调用工具），本地检索兜底
-        self._log_agent_trace("agent_fallback", track_id, frame_id, content="Agent 无结果，本地检索兜底")
-        return self._local_lookup_retrieve(hull_number, description, track_id=track_id, frame_id=frame_id)
+        return bboxes
 
     def _run_recognition(self, crop: np.ndarray, track_id: int = 0, frame_id: int = 0) -> AgentResult:
         """
-        统一识别调度：根据 use_agent 配置选择硬编码链路或 Agent 工具链。
-
-        - use_agent=False → _run_three_step_chain（直接调用 VLM HTTP API + 查库 + 语义检索）
-        - use_agent=True  → _run_agent_chain（VLM 预识别 + Agent 编排 lookup → retrieve）
+        执行识别链路：直接调用 VLM → 查库 → 语义检索。
         """
-        with self._latency.measure("agent"):
-            if self._use_agent:
-                return self._run_agent_chain(crop, track_id=track_id, frame_id=frame_id)
-            return self._run_three_step_chain(crop, track_id=track_id, frame_id=frame_id)
+        return self._run_three_step_chain(crop, track_id=track_id, frame_id=frame_id)
 
     # ── 推理结果处理 ────────────────────────────
 
-    def _handle_agent_result(
+    def _handle_result(
         self,
         track_id: int,
         frame_id: int,
         agent_result: AgentResult,
+        locate_bboxes: list[tuple[int, int, int, int]] | None = None,
     ) -> None:
         """处理识别结果：绑定到 track。"""
-        # 一条汇总日志：Step1(VLM) / Step2(Lookup) / Step3(Result)
         self._log_track_summary(track_id)
 
         # 绑定识别结果
@@ -384,32 +352,34 @@ class ShipPipeline:
         )
 
         if agent_result.match_type == "exact":
-            # 精确匹配 → 绿色（description 已在链路中获取，直接使用）
             self._tracker.bind_db_match(
                 track_id,
                 agent_result.hull_number,
                 agent_result.description,
             )
         elif agent_result.semantic_match_ids:
-            # 有语义匹配候选 → 黄色或红色
             self._tracker.bind_semantic_matches(track_id, agent_result.semantic_match_ids)
 
-    def _handle_agent_error(
+        # 绑定弦号定位结果
+        if locate_bboxes:
+            self._tracker.bind_locate_bboxes(track_id, locate_bboxes)
+
+    def _handle_error(
         self,
         track_id: int,
         frame_id: int,
         error: str,
     ) -> None:
-        """处理 Agent 推理错误：绑定空结果，避免 track 卡在 pending/未识别状态无限重试。"""
-        logger.warning("Agent 推理出错 (track=%d, frame=%d): %s", track_id, frame_id, error)
+        """处理推理错误：绑定空结果，避免 track 卡在 pending 状态。"""
+        logger.warning("推理出错 (track=%d, frame=%d): %s", track_id, frame_id, error)
         self._tracker.bind_result(
             track_id,
             hull_number="",
             description="",
             frame_id=frame_id,
         )
-        self._log_agent_trace(
-            "agent_error_bound_empty",
+        self._log_trace(
+            "error_bound_empty",
             track_id=track_id,
             frame_id=frame_id,
             content=f"错误绑定空结果: {error[:80]}",
@@ -422,13 +392,14 @@ class ShipPipeline:
         self,
         detections: list[Detection],
         frame_id: int,
+        frame_w: int,
+        frame_h: int,
     ) -> None:
         """级联模式：同步处理每个需要识别的检测目标。"""
         for det in detections:
             if det.crop is None or det.crop.size == 0:
                 continue
 
-            # 判断是否需要识别：新 track 或定时刷新
             need_new = self._tracker.needs_recognition(det.track_id)
             need_refresh = (
                 self._enable_refresh
@@ -441,7 +412,7 @@ class ShipPipeline:
             self._tracker.mark_pending(det.track_id)
 
             trace_type = "cascade_refresh" if need_refresh else "cascade_infer_start"
-            self._log_agent_trace(
+            self._log_trace(
                 trace_type,
                 track_id=det.track_id,
                 frame_id=frame_id,
@@ -449,20 +420,18 @@ class ShipPipeline:
             )
 
             try:
+                # 识别链路
                 agent_result = self._run_recognition(det.crop, track_id=det.track_id, frame_id=frame_id)
-                self._log_agent_trace(
-                    "recognition_result",
-                    track_id=det.track_id,
-                    frame_id=frame_id,
-                    content=(
-                        f"弦号={agent_result.hull_number or '(无)'} "
-                        f"匹配={agent_result.match_type} "
-                        f"语义候选={agent_result.semantic_match_ids}"
-                    ),
+
+                # 弦号定位（与识别并行获取）
+                locate_bboxes = self._locate_hull_number(
+                    det.crop, det, frame_w, frame_h,
+                    track_id=det.track_id, frame_id=frame_id,
                 )
-                self._handle_agent_result(det.track_id, frame_id, agent_result)
+
+                self._handle_result(det.track_id, frame_id, agent_result, locate_bboxes)
             except Exception as e:
-                self._handle_agent_error(det.track_id, frame_id, str(e))
+                self._handle_error(det.track_id, frame_id, str(e))
 
     # ── 并发模式 ────────────────────────────────
 
@@ -470,9 +439,10 @@ class ShipPipeline:
         self,
         detections: list[Detection],
         frame_id: int,
+        frame_w: int,
+        frame_h: int,
     ) -> None:
-        """并发模式：将 crop 送入队列，Agent 异步推理。队列半满时跳过入队（背压）。"""
-        # 背压：队列积压超过半满，跳过本轮入队，让 worker 追上
+        """并发模式：将 crop 送入队列，异步推理。队列半满时跳过入队（背压）。"""
         if self._task_queue.qsize() > self._max_queued_frames // 2:
             logger.debug("队列半满 (%d/%d)，跳过本轮入队", self._task_queue.qsize(), self._max_queued_frames)
             return
@@ -481,7 +451,6 @@ class ShipPipeline:
             if det.crop is None or det.crop.size == 0:
                 continue
 
-            # 判断是否需要识别：新 track 或定时刷新
             need_new = self._tracker.needs_recognition(det.track_id)
             need_refresh = (
                 self._enable_refresh
@@ -491,20 +460,28 @@ class ShipPipeline:
             if not need_new and not need_refresh:
                 continue
 
-            # 标记为 pending
             self._tracker.mark_pending(det.track_id)
+
+            # 构建坐标逆变换信息（在入队时计算，避免帧尺寸变化问题）
+            inverse_info = None
+            if self._enable_locate:
+                inverse_info = build_inverse_crop_info(
+                    det.bbox[0], det.bbox[1], det.bbox[2], det.bbox[3],
+                    frame_w, frame_h,
+                )
 
             task = {
                 "frame_id": frame_id,
                 "timestamp": time.time(),
                 "track_id": det.track_id,
                 "crop": det.crop.copy(),
+                "inverse_crop_info": inverse_info,
             }
 
             try:
                 self._task_queue.put_nowait(task)
                 trace_type = "concurrent_refresh_enqueue" if need_refresh else "concurrent_enqueue"
-                self._log_agent_trace(
+                self._log_trace(
                     trace_type,
                     track_id=det.track_id,
                     frame_id=frame_id,
@@ -515,11 +492,10 @@ class ShipPipeline:
                     "任务队列已满 (%d)，丢弃 frame=%d track=%d",
                     self._max_queued_frames, frame_id, det.track_id,
                 )
-                # 取消 pending 状态
                 self._tracker.cancel_pending(det.track_id)
 
-    def _agent_worker_loop(self) -> None:
-        """Agent 工作线程：从队列取任务并推理。"""
+    def _worker_loop(self) -> None:
+        """工作线程：从队列取任务并推理。"""
         try:
             while not self._stop_event.is_set():
                 try:
@@ -530,8 +506,9 @@ class ShipPipeline:
                 track_id = task["track_id"]
                 frame_id = task["frame_id"]
                 crop = task["crop"]
+                inverse_info = task.get("inverse_crop_info")
 
-                self._log_agent_trace(
+                self._log_trace(
                     "concurrent_infer_start",
                     track_id=track_id,
                     frame_id=frame_id,
@@ -540,22 +517,36 @@ class ShipPipeline:
 
                 try:
                     agent_result = self._run_recognition(crop, track_id=track_id, frame_id=frame_id)
+
+                    # 弦号定位
+                    locate_bboxes: list[tuple[int, int, int, int]] = []
+                    if self._enable_locate and self._locator and inverse_info:
+                        regions = self._locator.locate(crop, inverse_crop_info=inverse_info)
+                        locate_bboxes = [r.bbox for r in regions]
+                        self._log_trace(
+                            "locate",
+                            track_id=track_id,
+                            frame_id=frame_id,
+                            content=f"定位到 {len(locate_bboxes)} 个文字区域",
+                        )
+
                 except Exception as e:
-                    logger.exception("Agent 推理异常 (track=%d, frame=%d)", track_id, frame_id)
+                    logger.exception("推理异常 (track=%d, frame=%d)", track_id, frame_id)
                     agent_result = AgentResult(answer=str(e))
+                    locate_bboxes = []
 
                 try:
                     self._result_queue.put_nowait({
                         "frame_id": frame_id,
                         "track_id": track_id,
                         "agent_result": agent_result,
+                        "locate_bboxes": locate_bboxes,
                     })
                 except queue.Full:
                     logger.warning("结果队列已满，丢弃结果 (track=%d, frame=%d)", track_id, frame_id)
-                    # 结果队列满时直接绑定空结果，避免 track 卡死
                     self._tracker.bind_result(track_id, hull_number="", description="", frame_id=frame_id)
         except Exception:
-            logger.exception("Agent 工作线程意外退出")
+            logger.exception("工作线程意外退出")
 
     def _drain_results(self) -> int:
         """排空结果队列，处理所有已完成的异步推理结果。返回处理数量。"""
@@ -566,42 +557,42 @@ class ShipPipeline:
                 track_id = pending["track_id"]
                 frame_id = pending["frame_id"]
                 agent_result = pending["agent_result"]
+                locate_bboxes = pending.get("locate_bboxes", [])
 
-                # 有任何有效信息（弦号/语义匹配/非失败回答）都算有效结果
                 if (agent_result.hull_number
                         or agent_result.semantic_match_ids
                         or agent_result.match_type == "exact"
                         or agent_result.match_type == "semantic"):
-                    self._handle_agent_result(track_id, frame_id, agent_result)
+                    self._handle_result(track_id, frame_id, agent_result, locate_bboxes)
                 else:
-                    self._handle_agent_error(track_id, frame_id, agent_result.answer or "Agent 无结果")
+                    self._handle_error(track_id, frame_id, agent_result.answer or "无结果")
                 count += 1
             except queue.Empty:
                 break
         return count
 
-    def _start_agent_workers(self) -> None:
-        """启动 Agent 工作线程池。"""
+    def _start_workers(self) -> None:
+        """启动工作线程池。"""
         self._stop_event.clear()
-        self._agent_workers.clear()
+        self._worker_threads.clear()
         for i in range(self._max_concurrent):
             worker = threading.Thread(
-                target=self._agent_worker_loop,
-                name=f"agent-worker-{i}",
+                target=self._worker_loop,
+                name=f"worker-{i}",
                 daemon=True,
             )
             worker.start()
-            self._agent_workers.append(worker)
-        logger.info("启动 %d 个 Agent 工作线程", self._max_concurrent)
+            self._worker_threads.append(worker)
+        logger.info("启动 %d 个工作线程", self._max_concurrent)
 
-    def _stop_agent_workers(self) -> None:
-        """停止 Agent 工作线程，等待全部完成。"""
+    def _stop_workers(self) -> None:
+        """停止工作线程，等待全部完成。"""
         self._stop_event.set()
-        for worker in self._agent_workers:
+        for worker in self._worker_threads:
             worker.join(timeout=10.0)
             if worker.is_alive():
                 logger.warning("工作线程 %s 未在超时内退出", worker.name)
-        self._agent_workers.clear()
+        self._worker_threads.clear()
 
         # workers 已停止，排空未处理任务
         while True:
@@ -610,12 +601,12 @@ class ShipPipeline:
             except queue.Empty:
                 break
 
-        # 排空残留结果（worker 可能在 stop_event 后完成了最后一个任务）
+        # 排空残留结果
         remaining = self._drain_results()
         if remaining:
             logger.info("处理 %d 个残留结果", remaining)
 
-        logger.info("Agent 工作线程已停止")
+        logger.info("工作线程已停止")
 
     # ── 渲染 ────────────────────────────────────
 
@@ -625,7 +616,7 @@ class ShipPipeline:
         detections: list[Detection],
         frame_id: int,
     ) -> np.ndarray:
-        """通过 DemoRenderer 在帧上绘制检测框、识别结果和 HUD。"""
+        """通过 DemoRenderer 在帧上绘制检测框、识别结果、弦号定位框和 HUD。"""
         return self._renderer.render(
             frame=frame,
             detections=detections,
@@ -683,16 +674,16 @@ class ShipPipeline:
 
             # 启动并发 worker
             if self._concurrent_mode:
-                self._start_agent_workers()
+                self._start_workers()
 
             logger.info(
-                "开始处理: source=%s, mode=%s, inference=%s, demo=%s, refresh=%s(gap=%d), detect_every=%d, process_every=%d",
+                "开始处理: source=%s, mode=%s, demo=%s, refresh=%s(gap=%d), locate=%s, detect_every=%d, process_every=%d",
                 source,
                 "concurrent" if self._concurrent_mode else "cascade",
-                "agent" if self._use_agent else "hardcoded",
                 self._demo_enabled,
                 "on" if self._enable_refresh else "off",
                 self._gap_num,
+                "on" if self._enable_locate else "off",
                 self._detect_every_n,
                 self._process_every_n,
             )
@@ -709,6 +700,9 @@ class ShipPipeline:
 
                 # FPS 统计
                 self._fps.tick("stream")
+
+                # 帧尺寸
+                frame_h, frame_w = frame.shape[:2]
 
                 # ── 每 N 帧进行 YOLO 检测，其余帧复用上次结果 ──
                 should_detect = (frame_id % self._detect_every_n == 0)
@@ -730,21 +724,20 @@ class ShipPipeline:
                 for det in detections:
                     self._tracker.get_or_create(det.track_id, frame_id)
 
-                # ── process_every_n_frames 控制 Agent 推理频率 ──
+                # ── process_every_n_frames 控制推理频率 ──
                 should_process = (frame_id % self._process_every_n == 0)
 
                 if should_process:
-                    # Agent 推理（级联或并发）
                     if self._concurrent_mode:
-                        self._concurrent_process(detections, frame_id)
+                        self._concurrent_process(detections, frame_id, frame_w, frame_h)
                     else:
-                        self._cascade_process(detections, frame_id)
+                        self._cascade_process(detections, frame_id, frame_w, frame_h)
 
                 # 并发模式下排空已完成的结果（非阻塞）
                 if self._concurrent_mode:
                     self._drain_results()
 
-                # 每 30 帧清理一次过期 track（不必每帧扫描）
+                # 每 30 帧清理一次过期 track
                 if frame_id % 30 == 0:
                     self._tracker.cleanup_stale(frame_id)
 
@@ -755,7 +748,7 @@ class ShipPipeline:
                 else:
                     display_frame = frame
 
-                # 每 N 帧：有已识别的 track 就保存截图（需开启 save_screenshots）
+                # 每 N 帧：有已识别的 track 就保存截图
                 if self._save_screenshots and should_process:
                     active = self._tracker.active_tracks
                     if any(t.recognized for t in active.values()):
@@ -780,13 +773,12 @@ class ShipPipeline:
                 # 处理 FPS
                 self._fps.tick("process")
 
-                # 定期打印状态（每 5 秒，一条汇总）
+                # 定期打印状态（每 5 秒）
                 if self._fps.should_print("stream"):
                     elapsed = time.time() - start_time
                     stream_fps = self._fps.get_fps("stream")
                     process_fps = self._fps.get_fps("process")
 
-                    # Latency 部分
                     latency_parts = []
                     for stage in ("yolo", "agent", "demo"):
                         s = self._latency.get_stats(stage)
@@ -796,11 +788,10 @@ class ShipPipeline:
                             )
                     latency_str = f" | Latency: {' | '.join(latency_parts)}" if latency_parts else ""
 
-                    # 近期 track 部分（每 100 帧附带）
                     trace_str = ""
                     if frame_id % 100 < self._process_every_n:
                         with self._trace_lock:
-                            recent_tracks = len(set(e["track_id"] for e in self._agent_trace[-50:])) if self._agent_trace else 0
+                            recent_tracks = len(set(e["track_id"] for e in self._trace[-50:])) if self._trace else 0
                         if recent_tracks:
                             trace_str = f" | 近期处理: {recent_tracks} tracks"
 
@@ -812,7 +803,6 @@ class ShipPipeline:
 
             # ── 处理完成，收集统计 ──
 
-            # 并发模式下最终排空结果
             if self._concurrent_mode:
                 self._drain_results()
 
@@ -828,7 +818,6 @@ class ShipPipeline:
                 "elapsed_seconds": round(elapsed, 1),
                 "avg_fps": round(frame_id / elapsed, 1) if elapsed > 0 else 0,
                 "mode": "concurrent" if self._concurrent_mode else "cascade",
-                "inference": "agent" if self._use_agent else "hardcoded",
                 "screenshots_saved": self._saver.saved_count,
                 "latency": self._latency.get_all_stats(),
             }
@@ -862,7 +851,7 @@ class ShipPipeline:
 
         finally:
             if self._concurrent_mode:
-                self._stop_agent_workers()
+                self._stop_workers()
             input_src.release()
             if video_writer:
                 video_writer.release()
@@ -874,9 +863,9 @@ class ShipPipeline:
 
     @property
     def agent_trace(self) -> list[dict[str, Any]]:
-        """获取完整的 Agent 运行链路日志。"""
+        """获取完整的运行链路日志。"""
         with self._trace_lock:
-            return list(self._agent_trace)
+            return list(self._trace)
 
     # ── 运行时控制 ──────────────────────────────
 
@@ -891,15 +880,6 @@ class ShipPipeline:
             raise ValueError(f"不支持的提示词模式: {mode}，仅支持 detailed/brief")
         self._prompt_mode = mode
         logger.info("提示词模式切换为: %s", mode)
-
-    def set_use_agent(self, enabled: bool) -> None:
-        """设置 Agent 模式开关。"""
-        if enabled and self._agent is None:
-            from agent import create_agent
-            self._agent = create_agent(config=self._config)
-            logger.info("Agent 模式已启用：初始化 LangChain ReAct Agent")
-        self._use_agent = enabled
-        logger.info("推理模式: %s", "Agent (LangChain)" if enabled else "硬编码 (直接调用)")
 
     def switch_to_concurrent(self, enabled: bool) -> None:
         """动态切换级联/并发模式。"""

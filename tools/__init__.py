@@ -1,18 +1,15 @@
-"""LangChain 工具定义 — 可选 recognize_ship + lookup_by_hull_number + retrieve_by_description"""
+"""VLM 推理工具 — 调用视觉大模型进行弦号识别（供 pipeline 硬编码链路使用）"""
 
 from __future__ import annotations
 
 import json
 import logging
 import re
-from typing import Annotated
 
 import cv2
 import httpx
 import numpy as np
-from langchain_core.tools import tool
 
-from database import ShipDatabase
 from config import load_config
 
 logger = logging.getLogger(__name__)
@@ -128,79 +125,3 @@ def _vlm_infer(image_b64: str, prompt_mode: str = "detailed") -> dict:
         "hull_number": str(result.get("hull_number") or "").strip(),
         "description": str(result.get("description") or "").strip(),
     }
-
-
-def build_tools(db: ShipDatabase, include_recognize: bool = True) -> list:
-    """构建链路工具。
-
-    Args:
-        db: 船只数据库实例。
-        include_recognize: 是否包含 recognize_ship 工具。
-            True  = 独立运行模式（三步链路：recognize → lookup → retrieve）
-            False = Pipeline 模式（两步链路：lookup → retrieve，VLM 由外层预调用）
-    """
-    tools_list: list = []
-
-    if include_recognize:
-        @tool
-        def recognize_ship(
-            image_base64: Annotated[str, "裁剪的船只图像 base64 编码字符串（JPEG）"],
-        ) -> str:
-            """
-            第一步：对船只图像进行弦号识别。
-            调用视觉大模型分析图像，返回识别到的弦号和船只描述。
-            有弦号时接下来调 lookup_by_hull_number；无弦号时调 retrieve_by_description。
-            """
-            try:
-                result = _vlm_infer(image_base64)
-                return json.dumps(result, ensure_ascii=False)
-            except Exception as e:
-                logger.exception("船只识别失败")
-                return json.dumps({"error": str(e), "hull_number": "", "description": ""}, ensure_ascii=False)
-
-        tools_list.append(recognize_ship)
-
-    @tool
-    def lookup_by_hull_number(
-        hull_number: Annotated[str, "要查询的船弦号，例如 '0014'"],
-    ) -> str:
-        """
-        第二步：通过弦号精确查找船只描述。
-        recognize_ship 返回有弦号时调用此工具。found=true 则结束；found=false 进入第三步。
-        """
-        hull_number = hull_number.strip()
-        desc = db.lookup(hull_number)
-        if desc is not None:
-            return json.dumps(
-                {"found": True, "hull_number": hull_number, "description": desc},
-                ensure_ascii=False,
-            )
-        return json.dumps({"found": False, "hull_number": hull_number}, ensure_ascii=False)
-
-    @tool
-    def retrieve_by_description(
-        target_description: Annotated[str, "对目标船的外观文字描述，越详细越好"],
-    ) -> str:
-        """
-        第三步：基于 FAISS 向量库的语义检索。
-        当弦号查不到（第二步 found=false），或 recognize_ship 未识别到弦号时调用。
-        输入对船只的外观描述，返回最匹配的结果。
-        """
-        try:
-            results = db.semantic_search_filtered(target_description)
-            if not results:
-                raw = db.semantic_search(target_description)
-                if raw:
-                    return json.dumps(
-                        {"note": "以下结果相似度较低，仅供参考", "results": raw},
-                        ensure_ascii=False,
-                    )
-                return json.dumps({"error": "未找到匹配结果"}, ensure_ascii=False)
-
-            return json.dumps({"results": results}, ensure_ascii=False)
-        except Exception as e:
-            logger.exception("语义检索失败")
-            return json.dumps({"error": f"语义检索失败: {e}"}, ensure_ascii=False)
-
-    tools_list.extend([lookup_by_hull_number, retrieve_by_description])
-    return tools_list

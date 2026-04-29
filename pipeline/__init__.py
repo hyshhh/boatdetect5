@@ -10,6 +10,7 @@ Pipeline 模块 — 船弦号识别视频处理流水线
   - InputSource: 视频/相机/视频流输入
   - DemoRenderer: 可视化渲染
   - ScreenshotSaver: 截图保存
+  - HullNumberLocator: PaddleOCR 弦号定位
 """
 
 from pipeline.detector import ShipDetector  # noqa: F401
@@ -20,6 +21,7 @@ from pipeline.fps import FPSMeter, LatencyMeter  # noqa: F401
 from pipeline.video_input import InputSource  # noqa: F401
 from pipeline.demo import DemoRenderer  # noqa: F401
 from pipeline.output import ScreenshotSaver  # noqa: F401
+from pipeline.hull_number_locator import HullNumberLocator  # noqa: F401
 
 __all__ = [
     "ShipDetector",
@@ -31,4 +33,5 @@ __all__ = [
     "InputSource",
     "DemoRenderer",
     "ScreenshotSaver",
+    "HullNumberLocator",
 ]

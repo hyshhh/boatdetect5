@@ -136,9 +136,14 @@ class DemoRenderer:
         """
         canvas = frame.copy()
 
-        # 渲染检测框
+        # 渲染检测框 + 弦号定位虚线框
         for det in detections:
-            self._render_detection(canvas, det, tracks.get(det.track_id))
+            track_info = tracks.get(det.track_id)
+            self._render_detection(canvas, det, track_info)
+            # 弦号定位虚线框
+            if track_info and getattr(track_info, "locate_bboxes", None):
+                for bbox in track_info.locate_bboxes:
+                    self._render_locate_dashed_box(canvas, bbox)
 
         # 渲染 HUD
         if self._show_fps and fps_info:
@@ -262,6 +267,63 @@ class DemoRenderer:
             self._cjk_font,
             fill=(255, 255, 255),
         )
+
+    def _render_locate_dashed_box(
+        self,
+        canvas: np.ndarray,
+        bbox: tuple[int, int, int, int],
+    ) -> None:
+        """在帧上绘制弦号定位的虚线框（橙色虚线）。"""
+        x1, y1, x2, y2 = bbox
+        color = (0, 165, 255)  # 橙色 (BGR)
+        thickness = 2
+        dash_len = 10
+        gap_len = 6
+
+        # 绘制虚线矩形（四条边分别绘制）
+        self._draw_dashed_line(canvas, (x1, y1), (x2, y1), color, thickness, dash_len, gap_len)
+        self._draw_dashed_line(canvas, (x2, y1), (x2, y2), color, thickness, dash_len, gap_len)
+        self._draw_dashed_line(canvas, (x2, y2), (x1, y2), color, thickness, dash_len, gap_len)
+        self._draw_dashed_line(canvas, (x1, y2), (x1, y1), color, thickness, dash_len, gap_len)
+
+    @staticmethod
+    def _draw_dashed_line(
+        img: np.ndarray,
+        pt1: tuple[int, int],
+        pt2: tuple[int, int],
+        color: tuple[int, int, int],
+        thickness: int = 2,
+        dash_len: int = 10,
+        gap_len: int = 6,
+    ) -> None:
+        """在图像上绘制虚线段。"""
+        import math
+        x1, y1 = pt1
+        x2, y2 = pt2
+        dx = x2 - x1
+        dy = y2 - y1
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist < 1:
+            return
+
+        # 单位方向向量
+        ux = dx / dist
+        uy = dy / dist
+
+        pos = 0.0
+        drawing = True
+        while pos < dist:
+            if drawing:
+                end = min(pos + dash_len, dist)
+                sx = int(x1 + ux * pos)
+                sy = int(y1 + uy * pos)
+                ex = int(x1 + ux * end)
+                ey = int(y1 + uy * end)
+                cv2.line(img, (sx, sy), (ex, ey), color, thickness)
+                pos = end
+            else:
+                pos += gap_len
+            drawing = not drawing
 
     def _render_hud(
         self,

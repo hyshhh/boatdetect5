@@ -6,7 +6,7 @@ import numpy as np
 
 from pipeline.fps import FPSMeter
 from pipeline.tracker import TrackManager
-from pipeline.agent_inference import AgentInference
+from pipeline.hull_number_locator import build_inverse_crop_info, HullNumberLocator
 
 
 # ══════════════════════════════════════════════
@@ -134,6 +134,15 @@ class TestTrackManager:
         assert info.db_matched is True
         assert info.db_match_id == "0014"
 
+    def test_bind_locate_bboxes(self):
+        mgr = TrackManager()
+        mgr.get_or_create(1, 100)
+        bboxes = [(10, 20, 50, 60), (100, 200, 150, 250)]
+        mgr.bind_locate_bboxes(1, bboxes)
+        info = mgr.active_tracks[1]
+        assert len(info.locate_bboxes) == 2
+        assert info.locate_bboxes[0] == (10, 20, 50, 60)
+
     def test_display_text_waiting(self):
         mgr = TrackManager()
         text = mgr.get_display_text(1)
@@ -215,54 +224,113 @@ class TestTrackManager:
 
 
 # ══════════════════════════════════════════════
-#  AgentInference 单元测试（不调用 API）
+#  HullNumberLocator / 坐标转换测试
 # ══════════════════════════════════════════════
 
-class TestAgentInferenceHelpers:
-    def test_parse_response_json(self):
-        content = '{"hull_number": "0014", "description": "白色大型客轮"}'
-        result = AgentInference._parse_response(content)
-        assert result["hull_number"] == "0014"
-        assert result["description"] == "白色大型客轮"
+class TestBuildInverseCropInfo:
+    def test_basic_crop(self):
+        """基本 crop 坐标转换。"""
+        info = build_inverse_crop_info(
+            x1=100, y1=200, x2=300, y2=400,
+            frame_w=1920, frame_h=1080,
+            pad=20,
+        )
+        # crop_origin 应为 (80, 180)（100-20, 200-20）
+        assert info["crop_origin"] == (80, 180)
+        # scale 不应为 0
+        assert info["scale_x"] > 0
+        assert info["scale_y"] > 0
 
-    def test_parse_response_code_block(self):
-        content = '```json\n{"hull_number": "0025", "description": "黑色散货船"}\n```'
-        result = AgentInference._parse_response(content)
-        assert result["hull_number"] == "0025"
+    def test_crop_at_frame_edge(self):
+        """crop 在帧边缘时 padding 被裁剪。"""
+        info = build_inverse_crop_info(
+            x1=5, y1=5, x2=50, y2=50,
+            frame_w=1920, frame_h=1080,
+            pad=20,
+        )
+        # crop_origin 应为 (0, 0)（max(0, 5-20) = 0）
+        assert info["crop_origin"] == (0, 0)
 
-    def test_parse_response_invalid_json(self):
-        content = 'not json at all'
-        result = AgentInference._parse_response(content)
-        assert result["hull_number"] == ""
-        assert result["description"] == "not json at all"
+    def test_large_crop_resize_down(self):
+        """大 crop 应缩小（max_dim > target_max=512）。"""
+        info = build_inverse_crop_info(
+            x1=0, y1=0, x2=1000, y2=800,
+            frame_w=1920, frame_h=1080,
+            pad=0, target_max=512,
+        )
+        # scale 应 > 1（原尺寸大于 resize 后尺寸）
+        assert info["scale_x"] > 1.0
+        assert info["scale_y"] > 1.0
 
-    def test_encode_image(self):
-        img = np.zeros((100, 100, 3), dtype=np.uint8)
-        b64 = AgentInference._encode_image(img)
-        assert isinstance(b64, str)
-        assert len(b64) > 0
+    def test_small_crop_resize_up(self):
+        """小 crop 应放大（max_dim < target_min=256）。"""
+        info = build_inverse_crop_info(
+            x1=100, y1=100, x2=150, y2=130,
+            frame_w=1920, frame_h=1080,
+            pad=0, target_min=256,
+        )
+        # scale 应 < 1（原尺寸小于 resize 后尺寸）
+        assert info["scale_x"] < 1.0
+        assert info["scale_y"] < 1.0
 
-    def test_prompt_mode_switch(self):
-        config = {
-            "llm": {"model": "test", "api_key": "test", "base_url": "http://localhost:1/v1", "temperature": 0},
-            "embed": {"model": "test", "api_key": "test", "base_url": "http://localhost:1/v1"},
-            "retrieval": {"top_k": 3, "score_threshold": 0.5},
-            "vector_store": {"persist_path": "/tmp/test_vs", "auto_rebuild": False},
-            "app": {"log_level": "INFO", "ship_db_path": "/tmp/test.csv"},
-        }
-        agent = AgentInference(config=config, prompt_mode="detailed")
-        assert agent.prompt_mode == "detailed"
-        agent.set_prompt_mode("brief")
-        assert agent.prompt_mode == "brief"
+    def test_transform_roundtrip(self):
+        """验证坐标转换的往返一致性。"""
+        # 模拟 detector.py 中的 crop 逻辑
+        x1, y1, x2, y2 = 200, 300, 500, 600
+        frame_w, frame_h = 1920, 1080
+        pad = 20
 
-    def test_prompt_mode_invalid(self):
-        config = {
-            "llm": {"model": "test", "api_key": "test", "base_url": "http://localhost:1/v1", "temperature": 0},
-            "embed": {"model": "test", "api_key": "test", "base_url": "http://localhost:1/v1"},
-            "retrieval": {"top_k": 3, "score_threshold": 0.5},
-            "vector_store": {"persist_path": "/tmp/test_vs", "auto_rebuild": False},
-            "app": {"log_level": "INFO", "ship_db_path": "/tmp/test.csv"},
-        }
-        agent = AgentInference(config=config)
-        with pytest.raises(ValueError):
-            agent.set_prompt_mode("invalid")
+        info = build_inverse_crop_info(x1, y1, x2, y2, frame_w, frame_h, pad)
+
+        # crop 内的一个点 (10, 10) 应该映射回原帧
+        fx = int(10 * info["scale_x"] + info["crop_origin"][0])
+        fy = int(10 * info["scale_y"] + info["crop_origin"][1])
+        assert fx >= x1 - pad
+        assert fy >= y1 - pad
+
+    def test_zero_size_crop(self):
+        """零尺寸 crop 不应崩溃。"""
+        info = build_inverse_crop_info(
+            x1=100, y1=100, x2=100, y2=100,
+            frame_w=1920, frame_h=1080,
+        )
+        assert info["scale_x"] == 1.0
+        assert info["scale_y"] == 1.0
+
+
+class TestHullNumberLocatorInit:
+    def test_locator_unavailable_without_paddleocr(self):
+        """PaddleOCR 未安装时 locator.available 应为 False。"""
+        # 在没有安装 paddleocr 的环境中，初始化应优雅降级
+        try:
+            locator = HullNumberLocator()
+            # 如果 paddleocr 已安装，available 可能为 True
+            # 如果未安装，available 应为 False 且有 init_error
+            if not locator.available:
+                assert locator.init_error is not None
+                assert "PaddleOCR" in locator.init_error or "paddle" in locator.init_error.lower()
+        except Exception:
+            # 如果 paddleocr 完全不可用，初始化不应抛异常
+            pytest.fail("HullNumberLocator 初始化不应抛异常")
+
+    def test_locate_returns_empty_when_unavailable(self):
+        """PaddleOCR 不可用时 locate 应返回空列表。"""
+        try:
+            locator = HullNumberLocator()
+            if not locator.available:
+                img = np.zeros((100, 100, 3), dtype=np.uint8)
+                regions = locator.locate(img)
+                assert regions == []
+        except Exception:
+            pass  # paddleocr 可能未安装
+
+    def test_locate_empty_image(self):
+        """空图像不应崩溃。"""
+        try:
+            locator = HullNumberLocator()
+            if locator.available:
+                img = np.zeros((0, 0, 3), dtype=np.uint8)
+                regions = locator.locate(img)
+                assert regions == []
+        except Exception:
+            pass

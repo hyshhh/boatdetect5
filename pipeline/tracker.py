@@ -29,6 +29,7 @@ class TrackInfo:
     db_match_desc: str = ""        # 数据库匹配到的描述
     db_matched: bool = False       # 是否在数据库中精确匹配到
     semantic_match_ids: list[str] = field(default_factory=list)  # 语义检索匹配到的弦号列表
+    locate_bboxes: list[tuple[int, int, int, int]] = field(default_factory=list)  # 弦号定位框（原帧坐标）
 
 
 class TrackManager:
@@ -164,6 +165,16 @@ class TrackManager:
         with self._lock:
             if track_id in self._tracks:
                 self._tracks[track_id].semantic_match_ids = match_ids
+
+    def bind_locate_bboxes(
+        self,
+        track_id: int,
+        bboxes: list[tuple[int, int, int, int]],
+    ) -> None:
+        """绑定弦号定位结果（PaddleOCR 检测到的文字区域 bbox 列表，原帧坐标）。"""
+        with self._lock:
+            if track_id in self._tracks:
+                self._tracks[track_id].locate_bboxes = bboxes
 
     def get_display_text(self, track_id: int) -> str:
         """

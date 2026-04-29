@@ -34,17 +34,17 @@ app:
 # Pipeline 视频处理流水线配置
 pipeline:
   # 级联/并发双模式
-  # false = 级联模式：同步等待 Agent 返回结果（简单但阻塞，FPS 低）
-  # true  = 并发模式：YOLO 不等待，Agent 异步推理（推荐，FPS 高）
+  # false = 级联模式：同步等待推理返回结果（简单但阻塞，FPS 低）
+  # true  = 并发模式：YOLO 不等待，推理异步执行（推荐，FPS 高）
   concurrent_mode: true
 
-  # 最大并发 Agent 推理数
+  # 最大并发推理数
   max_concurrent: 4
 
   # 最大队列深度（并发模式下防止 OOM）
   max_queued_frames: 30
 
-  # 每 N 帧处理一次（1 = 每帧都处理，15 = 每 15 帧触发一次 Agent）
+  # 每 N 帧处理一次（1 = 每帧都处理，15 = 每 15 帧触发一次推理）
   # 并发模式下可设较小值（不阻塞），级联模式下建议设大（减少阻塞）
   process_every_n_frames: 15
 
@@ -57,12 +57,7 @@ pipeline:
   # 提示词模式："detailed"（详细）或 "brief"（简略）
   prompt_mode: "detailed"
 
-  # Agent/硬编码双模式开关
-  # false = 硬编码模式：直接调用 VLM + 查库 + 语义检索，无 LLM Agent 编排
-  # true  = Agent 模式：通过 LangChain ReAct Agent 链路调用 3 个工具（recognize_ship → lookup → retrieve）
-  use_agent: false
-
-  # 定时刷新开关：true 则每隔 gap_num 帧对已识别的 track 重新进行 Agent 识别
+  # 定时刷新开关：true 则每隔 gap_num 帧对已识别的 track 重新进行识别
   # false 则仅在新 track 出现时识别一次（现有逻辑不变）
   enable_refresh: false
 
@@ -106,3 +101,21 @@ pipeline:
 
   # 超过此帧数未出现的 track 被清理
   max_stale_frames: 300
+
+  # ── 弦号定位配置 ──────────────────────────────
+  # 弦号定位开关：true 则在 crop 中使用 PaddleOCR 定位弦号文字区域，
+  # 并在 demo 中绘制虚线框
+  enable_hull_number_locate: false
+
+  # 弦号定位参数
+  hull_number_locate:
+    # 是否使用 GPU（需要 paddlepaddle-gpu）
+    use_gpu: false
+    # OCR 语言（"en" 适合英文/数字弦号）
+    lang: "en"
+    # 文字检测阈值（越低越敏感，检出更多区域）
+    det_db_thresh: 0.3
+    # 文字检测框阈值（越低框越大）
+    det_db_box_thresh: 0.5
+    # 识别批处理大小
+    rec_batch_num: 1
