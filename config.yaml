@@ -109,13 +109,16 @@ pipeline:
 
   # 弦号定位参数
   hull_number_locate:
-    # 是否使用 GPU（需要 paddlepaddle-gpu）
+    # 是否使用 GPU（需要 paddlepaddle/paddlepaddle-gpu）
     use_gpu: false
     # OCR 语言（"en" 适合英文/数字弦号）
     lang: "en"
     # 文字检测阈值（越低越敏感，检出更多区域）
+    # PaddleOCR 3.x 对应 text_det_thresh
     det_db_thresh: 0.3
     # 文字检测框阈值（越低框越大）
+    # PaddleOCR 3.x 对应 text_det_box_thresh
     det_db_box_thresh: 0.5
     # 识别批处理大小
+    # PaddleOCR 3.x 对应 text_recognition_batch_size
     rec_batch_num: 1

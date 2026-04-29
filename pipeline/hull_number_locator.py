@@ -4,7 +4,7 @@ HullNumberLocator — 基于 PaddleOCR 的弦号定位模块
 在 YOLO crop 中定位弦号文字区域，返回原帧坐标系下的虚线框位置。
 支持坐标转换：crop 坐标 → 原帧坐标。
 
-版本兼容：PaddleOCR 2.5+ / 2.6+ / 2.7+ / 3.x（PP-OCRv4+）
+版本兼容：PaddleOCR 2.5+ / 2.6+ / 2.7+ / 3.x（PP-OCRv3 ~ PP-OCRv5）
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ class HullNumberLocator:
     ):
         """
         Args:
-            use_gpu: 是否使用 GPU（需要 paddlepaddle-gpu）。
+            use_gpu: 是否使用 GPU（需要 paddlepaddle / paddlepaddle-gpu）。
             lang: OCR 语言，"en" 适合英文/数字弦号。
             det_db_thresh: 文字检测阈值（越低越敏感）。
             det_db_box_thresh: 文字检测框阈值。
@@ -83,18 +83,22 @@ class HullNumberLocator:
             _major = int(_ver.split(".")[0]) if _ver[0].isdigit() else 0
 
             if _major >= 3:
-                # PaddleOCR 3.x: use_angle_cls → use_textline_orientation,
-                #                 use_gpu → device
+                # PaddleOCR 3.x: 参数全面重命名
+                #   use_angle_cls → use_textline_orientation
+                #   use_gpu → device (common arg)
+                #   det_db_thresh → text_det_thresh
+                #   det_db_box_thresh → text_det_box_thresh
+                #   rec_batch_num → text_recognition_batch_size
                 init_kwargs = dict(
                     use_textline_orientation=True,
                     lang=self._lang,
                     device="gpu" if self._use_gpu else "cpu",
-                    det_db_thresh=self._det_db_thresh,
-                    det_db_box_thresh=self._det_db_box_thresh,
-                    rec_batch_num=self._rec_batch_num,
+                    text_det_thresh=self._det_db_thresh,
+                    text_det_box_thresh=self._det_db_box_thresh,
+                    text_recognition_batch_size=self._rec_batch_num,
                 )
             else:
-                # PaddleOCR 2.x: use_angle_cls, use_gpu
+                # PaddleOCR 2.x: 旧参数名
                 init_kwargs = dict(
                     use_angle_cls=True,
                     lang=self._lang,
@@ -118,7 +122,7 @@ class HullNumberLocator:
             self._init_error = (
                 f"PaddleOCR 导入失败: {e}\n"
                 "请确认 paddleocr 与 paddlepaddle 版本匹配:\n"
-                "  - PaddleOCR 3.x: pip install paddlepaddle-gpu>=3.0.0 paddleocr>=3.0.0\n"
+                "  - PaddleOCR 3.x: pip install paddlepaddle>=3.0.0 paddleocr>=3.0.0\n"
                 "  - PaddleOCR 2.x: pip install paddlepaddle-gpu==2.6.0 paddleocr==2.7.0.3"
             )
             logger.warning(self._init_error)
@@ -159,8 +163,12 @@ class HullNumberLocator:
             return []
 
         try:
-            # PaddleOCR 3.x: ocr() → predict()，不再接受 cls 参数
-            results = self._ocr.ocr(crop)
+            # PaddleOCR 3.x: ocr() 已废弃，优先用 predict()
+            # PaddleOCR 2.x: 只有 ocr()
+            if hasattr(self._ocr, "predict"):
+                results = self._ocr.predict(crop)
+            else:
+                results = self._ocr.ocr(crop)
             logger.debug("PaddleOCR 原始返回: type=%s, value=%s", type(results), results)
         except Exception as e:
             logger.debug("PaddleOCR 推理异常: %s", e)
