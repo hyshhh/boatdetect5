@@ -107,8 +107,8 @@ class HullNumberLocator:
             try:
                 # PaddleOCR >= 2.7 支持 show_log
                 self._ocr = PaddleOCR(show_log=False, **init_kwargs)
-            except TypeError:
-                # PaddleOCR 2.5/2.6 不支持 show_log
+            except (TypeError, ValueError):
+                # PaddleOCR 2.5/2.6 不支持 show_log; 3.x 也不支持
                 self._ocr = PaddleOCR(**init_kwargs)
             logger.info(
                 "PaddleOCR 初始化成功 (gpu=%s, lang=%s, version=%s)",
