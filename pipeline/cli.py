@@ -177,21 +177,20 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    # 配置日志
+    from config import load_config
+    from pipeline.pipeline import ShipPipeline
+
+    config = load_config()
+
+    # 配置日志（第一次：先设置基本格式，PaddleOCR 初始化时会被覆盖）
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    # 抑制第三方库 HTTP 日志
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-    from config import load_config
-    from pipeline.pipeline import ShipPipeline
-
-    config = load_config()
 
     # 合并命令行参数到配置（仅覆盖用户显式传入的参数）
     config.setdefault("pipeline", {})
@@ -262,6 +261,23 @@ def main() -> None:
     # 创建并运行流水线
     try:
         pipeline = ShipPipeline(config=config)
+
+        # 重新配置日志（PaddleOCR/PaddleX 初始化后会抢占 root logger）
+        root = logging.getLogger()
+        for h in root.handlers[:]:
+            root.removeHandler(h)
+        logging.basicConfig(
+            level=log_level,
+            format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+            datefmt="%H:%M:%S",
+            force=True,
+        )
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+        logger = logging.getLogger(__name__)
+        logger.info("日志系统就绪，开始处理视频...")
+
         stats = pipeline.process(
             source=args.source,
             output_path=args.output,
