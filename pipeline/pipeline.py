@@ -312,7 +312,8 @@ class ShipPipeline:
         )
 
         # PaddleOCR 定位
-        regions = self._locator.locate(crop, inverse_crop_info=inverse_info)
+        with self._latency.measure("locate"):
+            regions = self._locator.locate(crop, inverse_crop_info=inverse_info)
 
         bboxes = [r.bbox for r in regions]
 
@@ -521,7 +522,8 @@ class ShipPipeline:
                     # 弦号定位
                     locate_bboxes: list[tuple[int, int, int, int]] = []
                     if self._enable_locate and self._locator and inverse_info:
-                        regions = self._locator.locate(crop, inverse_crop_info=inverse_info)
+                        with self._latency.measure("locate"):
+                            regions = self._locator.locate(crop, inverse_crop_info=inverse_info)
                         locate_bboxes = [r.bbox for r in regions]
                         self._log_trace(
                             "locate",
@@ -780,7 +782,7 @@ class ShipPipeline:
                     process_fps = self._fps.get_fps("process")
 
                     latency_parts = []
-                    for stage in ("yolo", "agent", "demo"):
+                    for stage in ("yolo", "locate", "agent", "demo"):
                         s = self._latency.get_stats(stage)
                         if s and s["count"] > 0:
                             latency_parts.append(
