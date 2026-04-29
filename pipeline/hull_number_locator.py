@@ -114,10 +114,12 @@ class HullNumberLocator:
                 "PaddleOCR 初始化成功 (gpu=%s, lang=%s, version=%s)",
                 self._use_gpu, self._lang, _ver,
             )
-        except ImportError:
+        except ImportError as e:
             self._init_error = (
-                "PaddleOCR 未安装。请安装: "
-                "pip install paddlepaddle-gpu==2.5.2 paddleocr==2.7.0.3"
+                f"PaddleOCR 导入失败: {e}\n"
+                "请确认 paddleocr 与 paddlepaddle 版本匹配:\n"
+                "  - PaddleOCR 3.x: pip install paddlepaddle-gpu>=3.0.0 paddleocr>=3.0.0\n"
+                "  - PaddleOCR 2.x: pip install paddlepaddle-gpu==2.6.0 paddleocr==2.7.0.3"
             )
             logger.warning(self._init_error)
         except Exception as e:
