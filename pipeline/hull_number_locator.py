@@ -159,30 +159,72 @@ class HullNumberLocator:
             return []
 
         try:
-            results = self._ocr.ocr(crop, cls=True)
+            # PaddleOCR 3.x: ocr() → predict()，不再接受 cls 参数
+            results = self._ocr.ocr(crop)
+            logger.debug("PaddleOCR 原始返回: type=%s, value=%s", type(results), results)
         except Exception as e:
             logger.debug("PaddleOCR 推理异常: %s", e)
             return []
 
-        if not results or not results[0]:
+        if not results:
             return []
 
         regions: list[TextRegion] = []
 
-        for line in results[0]:
-            if not line or len(line) < 2:
+        # 兼容 PaddleOCR 2.x 和 3.x 返回格式
+        # 2.x: results = [[ [points, (text, conf)], ... ]]
+        # 3.x: results = [result_obj, ...]  每个 result_obj 有 text_det_poly, rec_text, score 等属性
+        ocr_items = []
+        if results and isinstance(results[0], list):
+            # 2.x 格式
+            ocr_items = results[0] if results[0] else []
+        elif results and hasattr(results[0], "rec_text"):
+            # 3.x 格式：result 对象
+            for r in results:
+                if hasattr(r, "dt_polys") and hasattr(r, "rec_text"):
+                    for i, poly in enumerate(r.dt_polys):
+                        text = r.rec_text[i] if i < len(r.rec_text) else ""
+                        score = r.score[i] if i < len(r.score) else 0.0
+                        ocr_items.append([poly.tolist() if hasattr(poly, "tolist") else poly, (text, score)])
+                elif hasattr(r, "text_res"):
+                    # 另一种 3.x 格式
+                    for item in r.text_res:
+                        if isinstance(item, dict):
+                            poly = item.get("dt_polys", item.get("polygon", []))
+                            text = item.get("rec_text", item.get("text", ""))
+                            score = item.get("score", 0.0)
+                            ocr_items.append([poly, (text, score)])
+        elif results and isinstance(results[0], dict):
+            # 某些版本直接返回 dict 列表
+            for item in results[0] if isinstance(results[0], list) else results:
+                if isinstance(item, dict):
+                    poly = item.get("dt_polys", item.get("polygon", item.get("points", [])))
+                    text = item.get("rec_text", item.get("text", ""))
+                    score = item.get("score", 0.0)
+                    ocr_items.append([poly, (text, score)])
+
+        if not ocr_items:
+            logger.info("PaddleOCR 未检测到文字 (items=%d, raw_type=%s)", len(results), type(results[0]) if results else None)
+            if results:
+                logger.info("PaddleOCR 原始返回详情: %s", results[:2])
+            return []
+
+        for item in ocr_items:
+            if not item or len(item) < 2:
                 continue
 
-            # line[0] = 四点坐标 [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-            # line[1] = (text, confidence)
-            points = line[0]
-            text_info = line[1]
+            # item[0] = 四点坐标, item[1] = (text, confidence)
+            points = item[0]
+            text_info = item[1]
 
-            if not isinstance(text_info, (list, tuple)) or len(text_info) < 2:
+            if isinstance(text_info, dict):
+                text = str(text_info.get("rec_text", text_info.get("text", ""))).strip()
+                confidence = float(text_info.get("score", 0.0))
+            elif isinstance(text_info, (list, tuple)) and len(text_info) >= 2:
+                text = str(text_info[0]).strip()
+                confidence = float(text_info[1])
+            else:
                 continue
-
-            text = str(text_info[0]).strip()
-            confidence = float(text_info[1])
 
             if not text:
                 continue
