@@ -76,17 +76,21 @@ class HullNumberLocator:
 
         try:
             from paddleocr import PaddleOCR
-            self._ocr = PaddleOCR(
+            # 版本兼容：不同版本支持的参数不同，逐步尝试
+            init_kwargs = dict(
                 use_angle_cls=True,
                 lang=self._lang,
                 use_gpu=self._use_gpu,
                 det_db_thresh=self._det_db_thresh,
                 det_db_box_thresh=self._det_db_box_thresh,
                 rec_batch_num=self._rec_batch_num,
-                show_log=False,
-                # 版本兼容：PaddleOCR 2.5+ 使用 PP-OCRv4 默认模型
-                # 不指定 model_dir，使用内置默认模型
             )
+            try:
+                # PaddleOCR >= 2.7 支持 show_log
+                self._ocr = PaddleOCR(show_log=False, **init_kwargs)
+            except TypeError:
+                # PaddleOCR 2.5/2.6 不支持 show_log
+                self._ocr = PaddleOCR(**init_kwargs)
             logger.info(
                 "PaddleOCR 初始化成功 (gpu=%s, lang=%s)",
                 self._use_gpu, self._lang,
