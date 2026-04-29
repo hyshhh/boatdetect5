@@ -4,7 +4,7 @@ HullNumberLocator — 基于 PaddleOCR 的弦号定位模块
 在 YOLO crop 中定位弦号文字区域，返回原帧坐标系下的虚线框位置。
 支持坐标转换：crop 坐标 → 原帧坐标。
 
-版本兼容：PaddleOCR 2.5+ / 2.6+ / 2.7+（PP-OCRv4）
+版本兼容：PaddleOCR 2.5+ / 2.6+ / 2.7+ / 3.x（PP-OCRv4+）
 """
 
 from __future__ import annotations
@@ -76,15 +76,34 @@ class HullNumberLocator:
 
         try:
             from paddleocr import PaddleOCR
-            # 版本兼容：不同版本支持的参数不同，逐步尝试
-            init_kwargs = dict(
-                use_angle_cls=True,
-                lang=self._lang,
-                use_gpu=self._use_gpu,
-                det_db_thresh=self._det_db_thresh,
-                det_db_box_thresh=self._det_db_box_thresh,
-                rec_batch_num=self._rec_batch_num,
-            )
+            import paddleocr
+
+            # 检测 PaddleOCR 版本以选择正确的参数
+            _ver = getattr(paddleocr, "__version__", "0")
+            _major = int(_ver.split(".")[0]) if _ver[0].isdigit() else 0
+
+            if _major >= 3:
+                # PaddleOCR 3.x: use_angle_cls → use_textline_orientation,
+                #                 use_gpu → device
+                init_kwargs = dict(
+                    use_textline_orientation=True,
+                    lang=self._lang,
+                    device="gpu" if self._use_gpu else "cpu",
+                    det_db_thresh=self._det_db_thresh,
+                    det_db_box_thresh=self._det_db_box_thresh,
+                    rec_batch_num=self._rec_batch_num,
+                )
+            else:
+                # PaddleOCR 2.x: use_angle_cls, use_gpu
+                init_kwargs = dict(
+                    use_angle_cls=True,
+                    lang=self._lang,
+                    use_gpu=self._use_gpu,
+                    det_db_thresh=self._det_db_thresh,
+                    det_db_box_thresh=self._det_db_box_thresh,
+                    rec_batch_num=self._rec_batch_num,
+                )
+
             try:
                 # PaddleOCR >= 2.7 支持 show_log
                 self._ocr = PaddleOCR(show_log=False, **init_kwargs)
@@ -92,8 +111,8 @@ class HullNumberLocator:
                 # PaddleOCR 2.5/2.6 不支持 show_log
                 self._ocr = PaddleOCR(**init_kwargs)
             logger.info(
-                "PaddleOCR 初始化成功 (gpu=%s, lang=%s)",
-                self._use_gpu, self._lang,
+                "PaddleOCR 初始化成功 (gpu=%s, lang=%s, version=%s)",
+                self._use_gpu, self._lang, _ver,
             )
         except ImportError:
             self._init_error = (
