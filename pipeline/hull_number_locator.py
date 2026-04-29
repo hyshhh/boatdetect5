@@ -169,53 +169,65 @@ class HullNumberLocator:
                 results = self._ocr.predict(crop)
             else:
                 results = self._ocr.ocr(crop)
-            logger.debug("PaddleOCR 原始返回: type=%s, value=%s", type(results), results)
+            # 强制打印返回值，方便排查格式问题
+            logger.info("PaddleOCR predict 返回: type=%s, len=%s", type(results), len(results) if results else 0)
+            if results:
+                first = results[0]
+                logger.info("  results[0]: type=%s, dir=%s", type(first), [a for a in dir(first) if not a.startswith("_")] if hasattr(first, "__dict__") else "N/A")
+                if hasattr(first, "__dict__"):
+                    logger.info("  results[0].__dict__: %s", {k: type(v).__name__ for k, v in first.__dict__.items()})
         except Exception as e:
-            logger.debug("PaddleOCR 推理异常: %s", e)
+            logger.warning("PaddleOCR 推理异常: %s", e, exc_info=True)
             return []
 
         if not results:
+            logger.info("PaddleOCR 返回空结果")
             return []
 
         regions: list[TextRegion] = []
 
         # 兼容 PaddleOCR 2.x 和 3.x 返回格式
         # 2.x: results = [[ [points, (text, conf)], ... ]]
-        # 3.x: results = [result_obj, ...]  每个 result_obj 有 text_det_poly, rec_text, score 等属性
+        # 3.x: results = [result_obj, ...]
         ocr_items = []
         if results and isinstance(results[0], list):
             # 2.x 格式
             ocr_items = results[0] if results[0] else []
+            logger.info("PaddleOCR 使用 2.x 格式, items=%d", len(ocr_items))
         elif results and hasattr(results[0], "rec_text"):
-            # 3.x 格式：result 对象
+            # 3.x 格式：result 对象有 rec_text 属性
+            logger.info("PaddleOCR 使用 3.x rec_text 格式")
             for r in results:
                 if hasattr(r, "dt_polys") and hasattr(r, "rec_text"):
                     for i, poly in enumerate(r.dt_polys):
                         text = r.rec_text[i] if i < len(r.rec_text) else ""
                         score = r.score[i] if i < len(r.score) else 0.0
                         ocr_items.append([poly.tolist() if hasattr(poly, "tolist") else poly, (text, score)])
-                elif hasattr(r, "text_res"):
-                    # 另一种 3.x 格式
-                    for item in r.text_res:
-                        if isinstance(item, dict):
-                            poly = item.get("dt_polys", item.get("polygon", []))
-                            text = item.get("rec_text", item.get("text", ""))
-                            score = item.get("score", 0.0)
-                            ocr_items.append([poly, (text, score)])
+        elif results and hasattr(results[0], "text_res"):
+            # 3.x 另一种格式
+            logger.info("PaddleOCR 使用 3.x text_res 格式")
+            for r in results:
+                for item in (r.text_res if isinstance(r.text_res, list) else []):
+                    if isinstance(item, dict):
+                        poly = item.get("dt_polys", item.get("polygon", []))
+                        text = item.get("rec_text", item.get("text", ""))
+                        score = item.get("score", 0.0)
+                        ocr_items.append([poly, (text, score)])
         elif results and isinstance(results[0], dict):
-            # 某些版本直接返回 dict 列表
-            for item in results[0] if isinstance(results[0], list) else results:
+            # dict 列表格式
+            logger.info("PaddleOCR 使用 dict 列表格式")
+            for item in (results[0] if isinstance(results[0], list) else results):
                 if isinstance(item, dict):
                     poly = item.get("dt_polys", item.get("polygon", item.get("points", [])))
                     text = item.get("rec_text", item.get("text", ""))
                     score = item.get("score", 0.0)
                     ocr_items.append([poly, (text, score)])
+        else:
+            # 未知格式，打印详情
+            logger.warning("PaddleOCR 未知返回格式! results[0] type=%s, value=%s", type(results[0]) if results else None, results[0] if results else None)
 
         if not ocr_items:
-            logger.info("PaddleOCR 未检测到文字 (items=%d, raw_type=%s)", len(results), type(results[0]) if results else None)
-            if results:
-                logger.info("PaddleOCR 原始返回详情: %s", results[:2])
-            return []
+            logger.warning("PaddleOCR 未检测到文字 (results_len=%d, results[0] type=%s)", len(results), type(results[0]) if results else None)
 
         for item in ocr_items:
             if not item or len(item) < 2:
